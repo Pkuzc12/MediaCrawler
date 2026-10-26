@@ -290,6 +290,7 @@ class ZhiHuClient(AbstractApiClient, ProxyRefreshMixin):
         content: ZhihuContent,
         crawl_interval: float = 1.0,
         callback: Optional[Callable] = None,
+        max_count: int = 10,
     ) -> List[ZhihuComment]:
         """
         Get all root-level comments for a specified post, this method will retrieve all comment information under a post
@@ -297,6 +298,7 @@ class ZhiHuClient(AbstractApiClient, ProxyRefreshMixin):
             content: Content detail object (question|article|video)
             crawl_interval: Crawl delay interval in seconds
             callback: Callback after completing one crawl
+            max_count: Maximum number of root-level comments to crawl per post
 
         Returns:
 
@@ -306,7 +308,7 @@ class ZhiHuClient(AbstractApiClient, ProxyRefreshMixin):
         offset: str = ""
         prev_offset: str = ""
         limit: int = 10
-        while not is_end:
+        while not is_end and len(result) < max_count:
             prev_offset = offset
             root_comment_res = await self.get_root_comments(content.content_id, content.content_type, offset, limit)
             if not root_comment_res:
@@ -321,6 +323,9 @@ class ZhiHuClient(AbstractApiClient, ProxyRefreshMixin):
 
             if prev_offset == offset:
                 break
+
+            if len(result) + len(comments) > max_count:
+                comments = comments[: max_count - len(result)]
 
             if callback:
                 await callback(comments)
