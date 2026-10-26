@@ -78,6 +78,44 @@ async def test_crawl_waits_and_returns_completed_status(service: CrawlerService)
     assert seen["ENABLE_CDP_MODE"] is True
     assert seen["CDP_CONNECT_EXISTING"] is True
     assert seen["CDP_DEBUG_PORT"] == service.settings.cdp_port
+    assert seen["BROWSER_LAUNCH_TIMEOUT"] == service.settings.cdp_timeout
+
+
+async def test_crawl_refuses_when_debug_port_is_closed(service: CrawlerService) -> None:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        free_port = probe.getsockname()[1]
+    service.settings = replace(service.settings, cdp_port=free_port)
+    with pytest.raises(ToolError) as error:
+        await service.crawl(search(), wait_seconds=0)
+    assert error.value.code == "CHROME_NOT_REACHABLE"
+    assert service.store.all_manifests() == []
+
+
+async def test_bundled_browser_fallback_is_blocked_and_explained(service: CrawlerService) -> None:
+    result = await service.crawl(search("fallback"), wait_seconds=20)
+    assert result["outcome"] == "failed"
+    assert "Could not connect to Chrome" in result["error"]
+    messages = " ".join(str(e["message"]) for e in service.store.tail_logs(result["run_id"], 1000))
+    assert "refuses to launch Playwright's bundled browser" in messages
+
+
+async def test_results_and_counts_are_deduplicated(service: CrawlerService) -> None:
+    result = await service.crawl(search("dupes"), wait_seconds=20)
+    assert result["record_counts"] == {"contents": 2, "comments": 2}
+
+    contents = await service.results(result["run_id"])
+    assert contents["total"] == 2
+    assert contents["duplicates_removed"] == 1
+    assert [record["id"] for record in contents["records"]] == ["n1", "n2"]
+    assert contents["records"][0]["keywords"] == ["海优", "优青"]
+
+    raw = await service.results(result["run_id"], raw=True)
+    assert raw["records"][0]["source_keywords"] == ["海优", "优青"]
+
+    comments = await service.results(result["run_id"], kind="comments")
+    assert [record["id"] for record in comments["records"]] == ["c1", "c2"]
+    assert comments["duplicates_removed"] == 1
 
 
 async def test_results_are_normalized_and_paged(service: CrawlerService) -> None:

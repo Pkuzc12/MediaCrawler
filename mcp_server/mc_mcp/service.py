@@ -73,6 +73,14 @@ ATTENTION_CLEAR_MARKERS = (
     "use cache login state",
     "crawler finished",
 )
+# Log lines (lowercased) showing the CDP connection failed; upstream then tries
+# Playwright's bundled browser and reports a misleading "Executable doesn't exist".
+CDP_FAILURE_MARKERS = (
+    "refuses to launch playwright's bundled browser",
+    "executable doesn't exist",
+    "falling back to standard mode",
+    "cannot connect to existing browser",
+)
 RECENT_LOG_LINES = 10
 RECENT_LOG_CHARS = 300
 MAX_LOG_LINE_CHARS = 2_000
@@ -201,6 +209,13 @@ class CrawlerService:
                     "MediaCrawler is not ready: " + " ".join(issues),
                     remediation="Call check for details.",
                 )
+            if not await asyncio.to_thread(self._cdp_port_open):
+                raise ToolError(
+                    "CHROME_NOT_REACHABLE",
+                    f"Nothing is listening on Chrome's remote-debugging port {self.settings.cdp_port}.",
+                    retryable=True,
+                    remediation="Ask the user to open Chrome and turn on chrome://inspect/#remote-debugging.",
+                )
             lease = InterProcessLease(self._lease_path())
             if not lease.acquire():
                 active = self._active_manifest()
@@ -296,6 +311,7 @@ class CrawlerService:
             ENABLE_CDP_MODE=True,
             CDP_CONNECT_EXISTING=True,
             CDP_DEBUG_PORT=self.settings.cdp_port,
+            BROWSER_LAUNCH_TIMEOUT=self.settings.cdp_timeout,
         )
         spec = {"root": str(self.settings.mediacrawler_root), "config": overrides}
         return json.dumps(spec, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
@@ -373,7 +389,9 @@ class CrawlerService:
                 outcome, error = "cancelled", None
             elif process.returncode != 0:
                 outcome = "failed"
-                error = f"MediaCrawler exited with code {process.returncode}. See recent_logs."
+                error = await asyncio.to_thread(self._diagnose_failure, run_id) or (
+                    f"MediaCrawler exited with code {process.returncode}. See recent_logs."
+                )
             elif record_count:
                 outcome, error = "data_available", None
             elif upstream_errors:
@@ -507,6 +525,19 @@ class CrawlerService:
                 pass
         return True
 
+    def _diagnose_failure(self, run_id: str) -> str | None:
+        """Explain failures whose upstream error message points the wrong way."""
+        messages = " ".join(
+            str(entry.get("message", "")).lower() for entry in self.store.tail_logs(run_id, 300)
+        )
+        if any(marker in messages for marker in CDP_FAILURE_MARKERS):
+            return (
+                f"Could not connect to Chrome on port {self.settings.cdp_port}. Make sure "
+                "chrome://inspect/#remote-debugging is on and click Allow in Chrome's "
+                f"confirmation dialog within {self.settings.cdp_timeout} seconds."
+            )
+        return None
+
     # ---- inspecting runs -------------------------------------------------
 
     @staticmethod
@@ -616,18 +647,12 @@ class CrawlerService:
         manifest = await asyncio.to_thread(self.store.load, run_id)
         found = await asyncio.to_thread(artifact_files.discover, self.store.data_dir(run_id))
         files = [item for item in found if item["record_type"] == kind]
-
-        def collect() -> tuple[list[dict[str, Any]], int]:
-            records: list[dict[str, Any]] = []
-            index = 0
-            for item in files:
-                for record in artifact_files.iter_records(Path(item["path"])):
-                    if offset <= index < offset + limit:
-                        records.append(truncate_value(record) if raw else normalize(record, kind))
-                    index += 1
-            return records, index
-
-        records, total = await asyncio.to_thread(collect)
+        unique = await asyncio.to_thread(artifact_files.unique_records, found, kind)
+        total = len(unique)
+        records = [
+            truncate_value(record) if raw else normalize(record, kind)
+            for record in unique[offset : offset + limit]
+        ]
         return {
             "ok": True,
             "run_id": run_id,
@@ -639,6 +664,7 @@ class CrawlerService:
             "returned": len(records),
             "next_offset": offset + len(records) if offset + len(records) < total else None,
             "records": records,
+            "duplicates_removed": sum(int(item["records"]) for item in files) - total,
             "files": [item["path"] for item in files],
             "available": artifact_files.count_by_type(found),
         }

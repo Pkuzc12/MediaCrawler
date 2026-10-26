@@ -26,6 +26,7 @@ CONFIG_NAMES = (
     "ENABLE_CDP_MODE",
     "CDP_CONNECT_EXISTING",
     "CDP_DEBUG_PORT",
+    "BROWSER_LAUNCH_TIMEOUT",
     "XHS_SPECIFIED_NOTE_URL_LIST",
     "TIEBA_SPECIFIED_ID_LIST",
     "TIEBA_CREATOR_URL_LIST",
@@ -128,14 +129,45 @@ def main() -> int:
     if control == "soft-error":
         print("MediaCrawler ERROR - upstream request failed", flush=True)
         return 0
+    if control == "fallback":
+        # What upstream crawlers do when the CDP connection fails.
+        import asyncio
+
+        from playwright.async_api import BrowserType
+
+        print("MediaCrawler ERROR - CDP mode launch failed, falling back to standard mode", flush=True)
+        asyncio.run(BrowserType().launch_persistent_context("profile"))
+        return 0
 
     output_dir = Path(args.save_data_path) / args.platform / "jsonl"
     output_dir.mkdir(parents=True, exist_ok=True)
+    if control == "dupes":
+        # The same post found by two keywords: stored twice, comments fetched twice.
+        rows = [
+            {**CONTENTS["xhs"], "note_id": "n1", "source_keyword": "海优"},
+            {**CONTENTS["xhs"], "note_id": "n2", "source_keyword": "海优"},
+            {**CONTENTS["xhs"], "note_id": "n1", "source_keyword": "优青"},
+        ]
+        comments = [
+            {"comment_id": "c1", "note_id": "n1", "content": "评论"},
+            {"comment_id": "c2", "note_id": "n2", "content": "评论2"},
+            {"comment_id": "c1", "note_id": "n1", "content": "评论"},
+        ]
+        for name, items in (("contents", rows), ("comments", comments)):
+            with (output_dir / f"search_{name}_2026-10-25.jsonl").open("w", encoding="utf-8") as handle:
+                for item in items:
+                    handle.write(json.dumps(item, ensure_ascii=False) + "\n")
+        return 0
+
     content = CONTENTS.get(args.platform, CONTENTS["xhs"])
     count = 3
     with (output_dir / f"{args.type}_contents_2026-10-25.jsonl").open("w", encoding="utf-8") as handle:
         for index in range(count):
-            handle.write(json.dumps({**content, "title": f"{content['title']} {index}"}, ensure_ascii=False) + "\n")
+            row = {**content, "title": f"{content['title']} {index}"}
+            for id_key in ("note_id", "aweme_id", "content_id"):
+                if id_key in row and index:
+                    row[id_key] = f"{row[id_key]}-{index}"
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
     if args.get_comment == "true":
         with (output_dir / f"{args.type}_comments_2026-10-25.jsonl").open("w", encoding="utf-8") as handle:
             handle.write(

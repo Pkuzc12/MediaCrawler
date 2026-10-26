@@ -24,7 +24,7 @@ CONTENT_FIELDS: dict[str, tuple[str, ...]] = {
     "shares": ("share_count", "video_share_count", "shared_count"),
     "views": ("video_play_count", "viewd_count"),
     "url": ("note_url", "aweme_url", "video_url", "content_url"),
-    "keyword": ("source_keyword",),
+    "keywords": ("source_keywords",),
 }
 
 COMMENT_FIELDS: dict[str, tuple[str, ...]] = {

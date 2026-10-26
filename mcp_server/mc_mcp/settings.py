@@ -14,6 +14,9 @@ class Settings:
     state_dir: Path
     python_executable: Path
     cdp_port: int = 9222
+    # How long MediaCrawler waits for the user to click Allow in Chrome's
+    # remote-debugging dialog (upstream BROWSER_LAUNCH_TIMEOUT, default 60).
+    cdp_timeout: int = 180
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -37,7 +40,9 @@ class Settings:
 
         port_value = os.environ.get("MC_MCP_CDP_PORT", "").strip()
         cdp_port = int(port_value) if port_value else 9222
-        return cls(root, state_dir, python_executable, cdp_port)
+        timeout_value = os.environ.get("MC_MCP_CDP_TIMEOUT", "").strip()
+        cdp_timeout = int(timeout_value) if timeout_value else 180
+        return cls(root, state_dir, python_executable, cdp_port, cdp_timeout)
 
     @property
     def main_file(self) -> Path:

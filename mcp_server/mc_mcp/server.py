@@ -151,8 +151,10 @@ def create_server(service: CrawlerService | None = None) -> MCPServer:
 
         kind: contents | comments | creators | contacts | dynamics.
         By default records use one shape across platforms (id, title, text, author, time,
-        likes, comments, collects, shares, views, url ...); raw=true returns upstream fields.
-        `files` lists the JSONL files, which can also be read directly.
+        likes, comments, collects, shares, views, url, keywords ...); raw=true returns
+        upstream fields. Posts and comments are de-duplicated by id: a post found by several
+        keywords appears once, with all of them in `keywords` (`source_keywords` when raw).
+        `files` lists the JSONL files, which can also be read directly but contain duplicates.
         """
         return await call("results", run_id, kind=kind, offset=offset, limit=limit, raw=raw)
 
