@@ -19,9 +19,52 @@
 
 import json
 import re
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import humps
+
+from tools import utils
+
+# window.__INITIAL_STATE__ is a JS object literal, not strict JSON. Tokens outside of
+# string literals that need rewriting before json can parse it:
+#   - bare `undefined` / `NaN` / `Infinity` / `-Infinity` values -> null
+#   - `new Set([...])` / `new Map([...])` -> the inner array
+# String literals are matched first and kept verbatim, so the word "undefined" inside a
+# note title/description is never touched (a blanket str.replace produced invalid JSON).
+_JS_STATE_TOKEN_RE = re.compile(
+    r'"[^"\\]*(?:\\.[^"\\]*)*"'  # JSON string literal: keep as-is
+    r"|new\s+(?:Set|Map)\(\s*\)"  # empty Set/Map -> []
+    r"|new\s+(?:Set|Map)\("  # Set/Map wrapper start -> dropped
+    r"|\)"  # wrapper end (JSON itself has no parentheses outside strings) -> dropped
+    r"|-?\bInfinity\b|\bNaN\b|\bundefined\b",  # non-JSON literals -> null
+    re.S,
+)
+
+
+def _replace_js_state_token(match: "re.Match[str]") -> str:
+    token = match.group(0)
+    if token.startswith('"'):
+        return token
+    if token.startswith("new"):
+        return "[]" if token.endswith(")") else ""
+    if token == ")":
+        return ""
+    return "null"
+
+
+def _js_state_to_json(raw: str) -> str:
+    """Normalize a JS __INITIAL_STATE__ literal into JSON text"""
+    return _JS_STATE_TOKEN_RE.sub(_replace_js_state_token, raw)
+
+
+def _decode_first_json_value(text: str) -> Any:
+    """Decode only the first JSON value; the greedy page regex may capture trailing script content"""
+    return json.JSONDecoder(strict=False).raw_decode(text.strip())[0]
+
+
+def _error_context(text: str, pos: int, radius: int = 40) -> str:
+    """repr of the text around the error position, to identify the offending literal"""
+    return repr(text[max(0, pos - radius): pos + radius])
 
 
 class XiaoHongShuExtractor:
@@ -41,13 +84,26 @@ class XiaoHongShuExtractor:
             # Either a CAPTCHA appeared or the note doesn't exist
             return None
 
-        state = re.findall(r"window.__INITIAL_STATE__=({.*})</script>", html)[
-            0
-        ].replace("undefined", '""')
-        if state != "{}":
-            note_dict = humps.decamelize(json.loads(state))
+        state = _js_state_to_json(
+            re.findall(r"window.__INITIAL_STATE__=({.*})</script>", html)[0]
+        )
+        if state == "{}":
+            return None
+        try:
+            note_dict = humps.decamelize(_decode_first_json_value(state))
             return note_dict["note"]["note_detail_map"][note_id]["note"]
-        return None
+        except json.JSONDecodeError as e:
+            utils.logger.warning(
+                f"[XiaoHongShuExtractor.extract_note_detail_from_html] parse failed, note_id: {note_id}, "
+                f"err: {e}, pos: {e.pos}, context: {_error_context(e.doc, e.pos)}"
+            )
+            return None
+        except (KeyError, TypeError) as e:
+            utils.logger.warning(
+                f"[XiaoHongShuExtractor.extract_note_detail_from_html] note detail not found in state, "
+                f"note_id: {note_id}, err: {e!r}"
+            )
+            return None
 
     def extract_creator_info_from_html(self, html: str) -> Optional[Dict]:
         """Extract user information from HTML
@@ -63,7 +119,14 @@ class XiaoHongShuExtractor:
         )
         if match is None:
             return None
-        info = json.loads(match.group(1).replace(":undefined", ":null"), strict=False)
-        if info is None:
+        try:
+            info = _decode_first_json_value(_js_state_to_json(match.group(1)))
+        except json.JSONDecodeError as e:
+            utils.logger.warning(
+                f"[XiaoHongShuExtractor.extract_creator_info_from_html] parse failed, "
+                f"err: {e}, pos: {e.pos}, context: {_error_context(e.doc, e.pos)}"
+            )
             return None
-        return info.get("user").get("userPageData")
+        if not isinstance(info, dict):
+            return None
+        return (info.get("user") or {}).get("userPageData")

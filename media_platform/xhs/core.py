@@ -345,6 +345,21 @@ class XiaoHongShuCrawler(AbstractCrawler):
             except KeyError as ex:
                 utils.logger.error(f"[XiaoHongShuCrawler.get_note_detail_async_task] have not fund note detail note_id:{note_id}, err: {ex}")
                 return None
+            except RetryError as ex:
+                # The HTML fallback exhausted its retries (e.g. page state failed to parse).
+                # Skip this note instead of aborting the whole asyncio.gather batch.
+                utils.logger.error(
+                    f"[XiaoHongShuCrawler.get_note_detail_async_task] Get note detail from html failed after retries, "
+                    f"note_id: {note_id}, err: {ex.last_attempt.exception()!r}"
+                )
+                return None
+            except Exception as ex:
+                # Any other single-note failure must not lose the rest of the batch.
+                # asyncio.CancelledError is a BaseException and still propagates.
+                utils.logger.exception(
+                    f"[XiaoHongShuCrawler.get_note_detail_async_task] Unexpected error, skip note_id: {note_id}, err: {ex!r}"
+                )
+                return None
 
     async def batch_get_note_comments(self, note_list: List[str], xsec_tokens: List[str]):
         """Batch get note comments"""
