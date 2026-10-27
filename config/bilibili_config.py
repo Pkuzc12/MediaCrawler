@@ -65,6 +65,16 @@ BILI_PREFERRED_CDN_HOSTS = [
     "upos-sz-estgoss.bilivideo.com",
 ]
 
+# Mirror selection for each DASH track: the first N candidates race for
+# BILI_MEDIA_RACE_SECONDS after their first byte (domestic mirrors often take
+# 1-2 s to start) and the fastest keeps going (its bytes are kept).
+# 1 disables racing and tries candidates strictly in order.
+BILI_MEDIA_RACE_CANDIDATES = 3
+BILI_MEDIA_RACE_SECONDS = 3.0
+# Switch to the next mirror (resuming from the same offset) when a mirror stays
+# below this speed for 20 s. 0 disables switching.
+BILI_MEDIA_MIN_MB_PER_MIN = 30
+
 # Whether to crawl user information
 CREATOR_MODE = True
 

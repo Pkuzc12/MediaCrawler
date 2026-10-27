@@ -694,6 +694,11 @@ class BilibiliCrawler(AbstractCrawler):
                 extra_headers=self._media_headers(),
                 # 偏好镜像排在 playurl 地址前面，默认的 3 个候选会挤掉 playurl 自己的地址
                 max_candidates=bili_media.MAX_DASH_CANDIDATES,
+                # 同一路流的各镜像是同一个文件：开局测速择优，途中太慢换镜像接着下
+                race_candidates=getattr(config, "BILI_MEDIA_RACE_CANDIDATES", 3),
+                race_seconds=getattr(config, "BILI_MEDIA_RACE_SECONDS", 3.0),
+                slow_min_rate=(getattr(config, "BILI_MEDIA_MIN_MB_PER_MIN", 30) * 1024 * 1024 / 60) or None,
+                mirror_resume=True,
             )
         else:
             self._media_downloader.update_credentials(
