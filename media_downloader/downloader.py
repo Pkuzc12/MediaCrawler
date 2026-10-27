@@ -29,6 +29,9 @@
    解码后的字节数与 ``Content-Length`` 不等，大小校验会 100% 误判。
 4. **临时文件带 URL 指纹**：URL 变化时自动作废旧片段，避免把新内容拼到旧半成品上。
 5. **失败不打断爬虫**：所有异常在 ``download`` 内部收敛为返回值与日志。
+6. **多镜像择优（可选，默认关闭）**：同一文件有多个镜像时，开局让前几个镜像同时取
+   开头一段比速度，赢家已收到的字节直接作为文件开头；下载途中速度跌破阈值就换到下一个
+   镜像，从断点接着下（``mirror_resume`` 让同一路径的各镜像共用一个临时文件）。
 """
 
 from __future__ import annotations
@@ -39,7 +42,9 @@ import os
 import random
 import re
 import shutil
+import time
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Mapping, Optional, Sequence
 from urllib.parse import urlsplit
@@ -92,6 +97,47 @@ _NEUTRAL_CONTENT_TYPES = (
 # 且会被"已存在即跳过"永久信任。下载器不支持 HLS，交给类型校验直接拒绝。
 
 
+MB = 1024 * 1024
+# 镜像测速结果的有效期：期内再下同一批镜像的文件时不必重新赛跑
+HOST_RATE_TTL = 600.0
+
+
+class MediaTooSlowError(MediaRetryableError):
+    """当前镜像速度低于阈值：不在同一地址重试，直接换下一个镜像接着下"""
+
+    def __init__(self, message: str, rate: float) -> None:
+        super().__init__(message)
+        self.rate = rate
+
+
+@dataclass
+class _RaceResult:
+    url: str
+    ok: bool = False
+    status: int = 0
+    start: int = 0
+    total: Optional[int] = None
+    content_type: Optional[str] = None
+    data: bytearray = field(default_factory=bytearray)
+    rate: float = 0.0
+    error: str = ""
+
+    @property
+    def complete(self) -> bool:
+        return self.total is not None and self.start + len(self.data) == self.total
+
+
+def _host(url: str) -> str:
+    try:
+        return urlsplit(url).netloc
+    except ValueError:
+        return ""
+
+
+def _mb_per_min(rate: float) -> float:
+    return rate * 60 / MB
+
+
 def is_expected_content_type(content_type: Optional[str], media_type: MediaType) -> bool:
     """判断响应的 Content-Type 是否与媒体类型相容。
 
@@ -136,7 +182,23 @@ class MediaDownloader:
         max_candidates: int = 3,
         base_dir: Optional[Path] = None,
         overwrite: bool = False,
+        race_candidates: int = 1,
+        race_seconds: float = 2.0,
+        race_max_bytes: int = 8 * MB,
+        slow_min_rate: Optional[float] = None,
+        slow_window: float = 20.0,
+        mirror_resume: bool = False,
     ) -> None:
+        """多镜像择优参数（默认全部关闭，行为与单地址顺序回退一致）：
+
+        :param race_candidates: 开局同时测速的候选数，<=1 表示不赛跑
+        :param race_seconds: 每个参赛连接最多读多久
+        :param race_max_bytes: 每个参赛连接最多读多少字节（赢家的这部分直接落盘）
+        :param slow_min_rate: 下载途中的最低速度（字节/秒），低于它就换下一个镜像；None 不检测
+        :param slow_window: 测速窗口（秒），每个窗口结束时判断一次
+        :param mirror_resume: 同一 URL 路径的候选共用临时文件，换镜像时从断点接着下。
+            只适用于"同一文件的多个镜像"（如 B 站 upos），开启后会校验各镜像报告的总长一致
+        """
         self.platform = platform
         self.proxy = proxy
         self.extra_headers = dict(extra_headers or {})
@@ -148,6 +210,14 @@ class MediaDownloader:
         self.max_candidates = max(1, max_candidates)
         self._base_dir = Path(base_dir) if base_dir is not None else None
         self.overwrite = overwrite
+        self.race_candidates = max(1, race_candidates)
+        self.race_seconds = race_seconds
+        self.race_max_bytes = race_max_bytes
+        self.slow_min_rate = slow_min_rate
+        self.slow_window = slow_window
+        self.mirror_resume = mirror_resume
+        # 镜像域名 -> (字节/秒, 测量时刻)，下载器在一次爬取内长期复用，后续文件可直接沿用
+        self._host_rates: dict[str, tuple[float, float]] = {}
 
     # ------------------------------------------------------------------ 对外 API
 
@@ -281,22 +351,61 @@ class MediaDownloader:
         safe_stem = sanitize_component(stem, "media")
         # 备用地址数量要有上限：抖音的 url_list 长度不可控，逐个试会放大成几十次请求
         candidates = [url, *[candidate for candidate in backup_urls if candidate]][: self.max_candidates]
+        candidates = [candidate for candidate in candidates if candidate]
 
-        for candidate in candidates:
-            if not candidate:
-                continue
-            part_path = target_dir / f"{safe_stem}.{url_fingerprint(candidate)}.{os.getpid()}.part"
+        def part_for(candidate: str) -> Path:
+            # mirror_resume：同一路径的各镜像是同一个文件，共用临时文件以便换镜像后接着下
+            key = urlsplit(candidate).path if self.mirror_resume else candidate
+            return target_dir / f"{safe_stem}.{url_fingerprint(key)}.{os.getpid()}.part"
+
+        # 一次下载内各镜像报告的文件总长，换镜像接着下时据此确认是同一个文件。
+        # 只在 mirror_resume 下启用：普通备用地址可能是不同的编码版本，总长本就不同
+        state: Optional[dict] = {} if self.mirror_resume else None
+        started = time.monotonic()
+        content_type: Optional[str] = None
+        winner: Optional[str] = None
+
+        if self.race_candidates > 1 and len(candidates) > 1:
+            known = self._order_by_known_rate(candidates)
+            if known is not None:
+                candidates = known
+            else:
+                candidates, finished = await self._race(client, item, candidates, part_for, state)
+                if finished is not None:
+                    winner, content_type = finished
+
+        for index, candidate in enumerate(candidates):
+            if winner is not None:
+                break
+            part_path = part_for(candidate)
+            # 最后一个候选没有退路，再慢也要下完
+            min_rate = self.slow_min_rate if index < len(candidates) - 1 else None
+            transfer_started = time.monotonic()
+            offset = part_path.stat().st_size if part_path.exists() else 0
             try:
-                content_type = await self._fetch_with_retry(client, item, candidate, part_path)
+                content_type = await self._fetch_with_retry(
+                    client, item, candidate, part_path, min_rate=min_rate, state=state
+                )
+            except MediaTooSlowError as exc:
+                self._remember_rate(candidate, exc.rate)
+                logger.warning("[download] 镜像过慢，换下一个接着下 %s: %s", redact_url(candidate), exc)
+                continue
             except MediaFatalError as exc:
                 logger.warning("[download] 放弃地址 %s: %s", redact_url(candidate), exc)
                 continue
             except MediaDownloadError as exc:
                 logger.warning("[download] 地址重试耗尽 %s: %s", redact_url(candidate), exc)
                 continue
+            transferred = part_path.stat().st_size - offset if part_path.exists() else 0
+            elapsed = time.monotonic() - transfer_started
+            if transferred > 0 and elapsed > 0:
+                self._remember_rate(candidate, transferred / elapsed)
+            winner = candidate
 
+        if winner is not None:
+            part_path = part_for(winner)
             resolved_extension = extension or guess_extension(
-                candidate,
+                winner,
                 content_type=content_type,
                 explicit=item.extension,
                 default=FALLBACK_EXTENSIONS.get(item.media_type, ".bin"),
@@ -312,10 +421,15 @@ class MediaDownloader:
 
             os.replace(part_path, final_path)
             self._cleanup_parts(target_dir, safe_stem, keep=None)
+            size = final_path.stat().st_size
+            elapsed = max(time.monotonic() - started, 1e-6)
             logger.info(
-                "[download] 下载完成: %s (%d bytes)",
+                "[download] 下载完成: %s (%d bytes)，来源 %s，用时 %.1fs，平均 %.0f MB/min",
                 final_path,
-                final_path.stat().st_size,
+                size,
+                _host(winner),
+                elapsed,
+                _mb_per_min(size / elapsed),
             )
             return final_path
 
@@ -324,6 +438,128 @@ class MediaDownloader:
         self._cleanup_parts(target_dir, safe_stem)
         logger.error("[download] 媒体下载失败，已尝试全部地址: %s", redact_url(url))
         return None
+
+    # ------------------------------------------------------------------ 多镜像择优
+
+    def _remember_rate(self, url: str, rate: float) -> None:
+        host = _host(url)
+        if host:
+            self._host_rates[host] = (rate, time.monotonic())
+
+    def _order_by_known_rate(self, candidates: list[str]) -> Optional[list[str]]:
+        """参赛的几个镜像最近都测过速时，按已知速度排序、省掉这一轮赛跑；否则返回 None"""
+        now = time.monotonic()
+        racers = candidates[: self.race_candidates]
+        rates = {}
+        for candidate in racers:
+            known = self._host_rates.get(_host(candidate))
+            if known is None or now - known[1] > HOST_RATE_TTL:
+                return None
+            rates[candidate] = known[0]
+        ordered = sorted(racers, key=lambda candidate: rates[candidate], reverse=True)
+        return ordered + candidates[len(racers):]
+
+    async def _race(
+        self,
+        client: httpx.AsyncClient,
+        item: MediaItem,
+        candidates: list[str],
+        part_for,
+        state: Optional[dict],
+    ) -> tuple[list[str], Optional[tuple[str, Optional[str]]]]:
+        """前 ``race_candidates`` 个候选同时从各自断点取一段，按速度重排候选。
+
+        赢家收到的字节写进它的临时文件，后续顺序下载从那里接着下，不浪费流量。
+        返回 (重排后的候选, 赢家已下完整个文件时的 (地址, Content-Type))。
+        """
+        racers = candidates[: self.race_candidates]
+        results = await asyncio.gather(
+            *(self._race_one(client, item, candidate, part_for(candidate)) for candidate in racers)
+        )
+        for result in results:
+            self._remember_rate(result.url, result.rate if result.ok else 0.0)
+        logger.info(
+            "[download] 镜像测速: %s",
+            "，".join(
+                f"{_host(r.url)} {_mb_per_min(r.rate):.0f} MB/min" if r.ok else f"{_host(r.url)} 失败({r.error})"
+                for r in results
+            ),
+        )
+        ok = sorted((r for r in results if r.ok), key=lambda r: r.rate, reverse=True)
+        if not ok:
+            return candidates, None
+
+        best = ok[0]
+        part_path = part_for(best.url)
+        # 赢家的数据从它请求的断点开始（服务端忽略 Range 回 200 时是从 0 开始）
+        mode = "ab" if best.status == 206 and best.start > 0 else "wb"
+        with open(part_path, mode) as file_obj:
+            file_obj.write(best.data)
+        if state is not None and best.total is not None:
+            state["total"] = best.total
+
+        failed = [r.url for r in results if not r.ok]
+        ordered = [r.url for r in ok] + failed + candidates[len(racers):]
+        if best.complete:
+            return ordered, (best.url, best.content_type)
+        return ordered, None
+
+    async def _race_one(
+        self, client: httpx.AsyncClient, item: MediaItem, url: str, part_path: Path
+    ) -> _RaceResult:
+        result = _RaceResult(url=url)
+        resume_from = part_path.stat().st_size if part_path.exists() else 0
+        headers = self._build_headers(item)
+        headers["Range"] = f"bytes={resume_from}-"
+        started = time.monotonic()
+        first_byte: Optional[float] = None
+        try:
+            # 首字节最多等 5 秒，之后再测 race_seconds
+            async with asyncio.timeout(self.race_seconds + 5):
+                async with client.stream("GET", url, headers=headers) as response:
+                    result.status = response.status_code
+                    if result.status not in (200, 206):
+                        result.error = f"HTTP {result.status}"
+                        return result
+                    result.content_type = response.headers.get("content-type")
+                    if not is_expected_content_type(result.content_type, item.media_type):
+                        result.error = f"类型 {result.content_type}"
+                        return result
+                    content_range = self._parse_content_range(response)
+                    if result.status == 206:
+                        if content_range is None or content_range[0] != resume_from or content_range[2] is None:
+                            result.error = "Content-Range 不可用"
+                            return result
+                        result.start = resume_from
+                    result.total = self._resolve_total_size(content_range, response, result.status)
+                    deadline: Optional[float] = None
+                    async for chunk in response.aiter_bytes():
+                        if first_byte is None:
+                            # 测速窗口从首字节开始：国内 upos 镜像首字节常要 1-2 秒（建连+回源），
+                            # 从发请求起算会把延迟当成速度差，大文件真正关心的是持续速度
+                            first_byte = time.monotonic()
+                            deadline = first_byte + self.race_seconds
+                        result.data += chunk
+                        if len(result.data) >= self.race_max_bytes or time.monotonic() >= deadline:
+                            break
+                        if result.complete:
+                            break
+        except TimeoutError:
+            # 超时前收到的字节仍是合法前缀
+            pass
+        except (httpx.HTTPError, httpx.InvalidURL, OSError) as exc:
+            if not result.data:
+                result.error = type(exc).__name__
+                return result
+        if result.total is not None and result.start + len(result.data) > result.total:
+            result.error = "数据超出总长"
+            return result
+        result.ok = bool(result.data)
+        if not result.ok and not result.error:
+            result.error = "无数据"
+        measured_from = first_byte if first_byte is not None else started
+        result.rate = len(result.data) / max(time.monotonic() - measured_from, 1e-6)
+        return result
 
     @staticmethod
     def _cleanup_parts(target_dir: Path, safe_stem: str, keep: Optional[Path] = None) -> None:
@@ -382,13 +618,21 @@ class MediaDownloader:
         item: MediaItem,
         url: str,
         part_path: Path,
+        min_rate: Optional[float] = None,
+        state: Optional[dict] = None,
     ) -> Optional[str]:
-        """带指数退避重试的单文件抓取，返回 Content-Type"""
+        """带指数退避重试的单文件抓取，返回 Content-Type。
+
+        ``min_rate`` 非空时速度跌破阈值立即抛 ``MediaTooSlowError``（不在本地址重试），
+        由调用方换下一个镜像接着下。
+        """
         last_error: Optional[Exception] = None
         for attempt in range(self.max_retries + 1):
             try:
-                return await self._fetch_once(client, item, url, part_path)
-            except MediaFatalError:
+                return await self._fetch_once(
+                    client, item, url, part_path, min_rate=min_rate, state=state
+                )
+            except (MediaFatalError, MediaTooSlowError):
                 raise
             # httpx.InvalidURL 不是 HTTPError 的子类（它是 Exception 的直接子类），
             # 漏掉它会让一个畸形地址直接终止整条候选回退链
@@ -421,8 +665,13 @@ class MediaDownloader:
         item: MediaItem,
         url: str,
         part_path: Path,
+        min_rate: Optional[float] = None,
+        state: Optional[dict] = None,
     ) -> Optional[str]:
         """执行一次流式 GET，成功返回 Content-Type。
+
+        ``state["total"]`` 记录本次下载已知的文件总长：换镜像接着下时，
+        新镜像报告的总长必须一致，否则说明不是同一个文件，丢弃片段重下。
 
         续传语义：
         - 总是带 ``Range``：无片段时为 ``bytes=0-``，有 ``.part`` 片段时从其末尾续传。
@@ -480,11 +729,21 @@ class MediaDownloader:
 
             use_append = status == 206 and resume_from > 0
             total_size = self._resolve_total_size(content_range, response, status)
+            if state is not None and total_size is not None:
+                known_total = state.get("total")
+                if known_total is not None and known_total != total_size:
+                    part_path.unlink(missing_ok=True)
+                    state["total"] = total_size
+                    raise MediaRetryableError(
+                        f"镜像报告的总长 {total_size} 与此前的 {known_total} 不同，丢弃片段重新下载"
+                    )
+                state["total"] = total_size
             # 服务端若无视 identity 强制压缩，落盘的是解码后的字节，与 Content-Length 不等
             encoded = response.headers.get("content-encoding", "").strip().lower() not in ("", "identity")
 
             written = resume_from if use_append else 0
             mode = "ab" if use_append else "wb"
+            window_start, window_written = time.monotonic(), written
             with open(part_path, mode) as file_obj:
                 # 必须使用不带 chunk_size 的 aiter_bytes()：传入 chunk_size 时 httpx 会
                 # 缓冲满该长度才产出数据，响应中途断开会让已接收的字节全部丢失，
@@ -494,6 +753,18 @@ class MediaDownloader:
                         continue
                     file_obj.write(chunk)
                     written += len(chunk)
+                    if min_rate is not None:
+                        now = time.monotonic()
+                        if now - window_start >= self.slow_window:
+                            rate = (written - window_written) / (now - window_start)
+                            if rate < min_rate:
+                                # 已写入的字节随文件关闭落盘，换镜像后从这里接着下
+                                raise MediaTooSlowError(
+                                    f"最近 {now - window_start:.0f}s 平均 {_mb_per_min(rate):.0f} MB/min，"
+                                    f"低于 {_mb_per_min(min_rate):.0f} MB/min",
+                                    rate,
+                                )
+                            window_start, window_written = now, written
 
         if written == 0:
             part_path.unlink(missing_ok=True)

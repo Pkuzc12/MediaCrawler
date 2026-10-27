@@ -102,6 +102,8 @@ class _MediaRequestHandler(BaseHTTPRequestHandler):
                 self._send_body(code, b"", "text/plain")
             elif path.startswith("/ok/") or path.startswith("/redirected/"):
                 self._handle_ok(path.rsplit("/", 1)[-1], query)
+            elif path.startswith("/mirror/"):
+                self._handle_mirror(path.rsplit("/", 1)[-1], query)
             elif path.startswith("/range-only/"):
                 # B 站腾讯 EdgeOne 镜像：不带 Range 的整文件 GET 回 567，只服务分段请求
                 if self._parse_range() is None:
@@ -138,7 +140,7 @@ class _MediaRequestHandler(BaseHTTPRequestHandler):
                 self._send_body(200, b"", DEFAULT_CONTENT_TYPE)
             else:
                 self._send_body(404, b"not found", "text/plain")
-        except (BrokenPipeError, ConnectionResetError):  # 客户端主动断开
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):  # 客户端主动断开
             self.close_connection = True
 
     # ------------------------------------------------------------------ 各路由实现
@@ -328,6 +330,33 @@ class _MediaRequestHandler(BaseHTTPRequestHandler):
         """URL 无扩展名，靠 Content-Type 推断"""
         content_type = self.media_server.content_types.get(name, "image/webp")
         self._send_body(200, self._content_for(name), content_type)
+
+    def _handle_mirror(self, name: str, query) -> None:
+        """同一文件的一个镜像（路径相同即同一文件，用 query 区分镜像），支持 Range。
+
+        ``?speed=slow``：每 256 字节停顿 ``pause`` 秒（默认 0.05）；``fast`` 不停顿。
+        ``?extra=N``：内容末尾多 N 字节，模拟总长不一致（其实不是同一个文件）的镜像。
+        ``?delay=S``：先等 S 秒再响应，模拟首字节慢（建连/回源）但之后传输快的镜像。
+        """
+        time.sleep(float(query.get("delay", ["0"])[0]))
+        content = self._content_for(name) + b"x" * int(query.get("extra", ["0"])[0])
+        total = len(content)
+        start = self._parse_range() or 0
+        if start >= total:
+            self._send_body(416, b"", "text/plain", {"Content-Range": f"bytes */{total}"})
+            return
+        self.send_response(206)
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Content-Length", str(total - start))
+        self.send_header("Content-Range", f"bytes {start}-{total - 1}/{total}")
+        self.end_headers()
+        slow = query.get("speed", ["fast"])[0] == "slow"
+        pause = float(query.get("pause", ["0.05"])[0])
+        for offset in range(start, total, 256):
+            self.wfile.write(content[offset : offset + 256])
+            self.wfile.flush()
+            if slow:
+                time.sleep(pause)
 
     def _handle_slow(self, name: str, query) -> None:
         delay = float(query.get("s", ["1"])[0])
