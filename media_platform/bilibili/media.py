@@ -45,9 +45,11 @@ MP4_FNVAL = 1
 _CODEC_PRIORITY = {7: 0, 13: 1, 12: 2}
 _UNKNOWN_CODEC_PRIORITY = 3
 
-# upos 源站镜像：同一条签名路径在任意 upos-*.bilivideo.com 上都可用，可以换域名；
-# mcdn/PCDN 等其他域名的路径和签名规则不同，不能换
+# upos 源站镜像：同一条签名路径在任意 upos-*.bilivideo.com 上都可用，可以换域名。
+# playurl 有时直接把海外的 upos-*.akamaized.net 给成主地址，它的参数（多一个 hdnts）
+# 换到国内 upos 域名上同样有效（2026-10-27 实测 206）；mcdn/PCDN 的路径和签名规则不同，不能换
 _UPOS_HOST = re.compile(r"^upos-[a-z0-9-]+\.bilivideo\.com$")
+_UPOS_ANY_HOST = re.compile(r"^upos-[a-z0-9-]+\.(?:bilivideo\.com|akamaized\.net)$")
 # 有效候选地址上限：偏好镜像 + playurl 主地址 + 备用地址
 MAX_DASH_CANDIDATES = 8
 
@@ -84,28 +86,35 @@ def _stream_backup_urls(stream) -> tuple:
     return tuple(url for url in backups if isinstance(url, str) and url)
 
 
-def _is_domestic(url: str) -> bool:
-    return urlsplit(url).netloc.endswith(".bilivideo.com")
+def _is_overseas(url: str) -> bool:
+    """海外 CDN（Akamai），国内访问又慢又容易中途断流"""
+    return urlsplit(url).netloc.endswith(".akamaized.net")
 
 
 def order_stream_urls(stream) -> Tuple[str, Tuple[str, ...]]:
     """按下载优先级排列一路流的候选地址，返回 (主地址, 备用地址)。
 
-    顺序：主地址换成 ``BILI_PREFERRED_CDN_HOSTS`` 里的各个镜像 -> playurl 给的主地址
-    -> 国内备用地址 -> 海外备用地址（Akamai 等）。playurl 的主地址常是腾讯 EdgeOne
-    或 cos 镜像，备用地址常是海外的 Akamai，国内用户实测都明显慢于阿里/华为镜像。
+    顺序：``BILI_PREFERRED_CDN_HOSTS`` 里的各个镜像 -> playurl 给的国内地址
+    -> 海外地址（Akamai 等）。偏好镜像的地址由 playurl 地址换域名得到，模板优先取国内
+    upos 地址，没有时取 Akamai 的。playurl 的主地址并不固定，有时直接是海外的 Akamai，
+    所以海外地址无论是主地址还是备用地址都排到最后。实际用哪个由下载器开局测速决定。
     """
-    primary = _stream_url(stream)
-    backups = _stream_backup_urls(stream)
+    urls = [url for url in (_stream_url(stream), *_stream_backup_urls(stream)) if url]
+    upos_urls = [
+        url for url in urls
+        if _UPOS_ANY_HOST.match(urlsplit(url).netloc) and urlsplit(url).path.startswith("/upgcxcode/")
+    ]
+    template = next((url for url in upos_urls if _UPOS_HOST.match(urlsplit(url).netloc)), None)
+    template = template or next(iter(upos_urls), None)
+
     candidates: List[str] = []
-    parts = urlsplit(primary)
-    if _UPOS_HOST.match(parts.netloc) and parts.path.startswith("/upgcxcode/"):
+    if template is not None:
+        parts = urlsplit(template)
         for host in getattr(config, "BILI_PREFERRED_CDN_HOSTS", None) or []:
             if isinstance(host, str) and host:
                 candidates.append(urlunsplit(parts._replace(netloc=host)))
-    candidates.append(primary)
-    candidates.extend(url for url in backups if _is_domestic(url))
-    candidates.extend(url for url in backups if not _is_domestic(url))
+    candidates.extend(url for url in urls if not _is_overseas(url))
+    candidates.extend(url for url in urls if _is_overseas(url))
 
     ordered = list(dict.fromkeys(url for url in candidates if url))
     return ordered[0], tuple(ordered[1:])

@@ -767,6 +767,35 @@ def test_bilibili_stream_urls_prefer_configured_mirrors(monkeypatch):
     )
 
 
+def test_bilibili_stream_urls_demote_akamai_primary(monkeypatch):
+    """回归：playurl 把 Akamai 给成主地址时，国内镜像仍要排在前面，Akamai 排到最后"""
+    monkeypatch.setattr(
+        config,
+        "BILI_PREFERRED_CDN_HOSTS",
+        ["upos-sz-mirrorali.bilivideo.com", "upos-sz-mirrorhw.bilivideo.com"],
+    )
+    akamai = "https://upos-hz-mirrorakam.akamaized.net" + UPOS_PATH + "&hdnts=x"
+    cosov = "https://upos-sz-mirrorcosov.bilivideo.com" + UPOS_PATH
+    stream = {"base_url": akamai, "backup_url": [cosov]}
+
+    primary, backups = bili_media.order_stream_urls(stream)
+
+    # 模板优先取国内 upos 地址（不带 Akamai 的 hdnts）
+    assert primary == "https://upos-sz-mirrorali.bilivideo.com" + UPOS_PATH
+    assert backups == ("https://upos-sz-mirrorhw.bilivideo.com" + UPOS_PATH, cosov, akamai)
+
+
+def test_bilibili_stream_urls_use_akamai_query_when_it_is_the_only_upos_url(monkeypatch):
+    """只有 Akamai 地址时用它的参数换到国内镜像（实测国内镜像接受这组签名）"""
+    monkeypatch.setattr(config, "BILI_PREFERRED_CDN_HOSTS", ["upos-sz-mirrorali.bilivideo.com"])
+    akamai = "https://upos-hz-mirrorakam.akamaized.net" + UPOS_PATH + "&hdnts=x"
+
+    assert bili_media.order_stream_urls({"base_url": akamai}) == (
+        "https://upos-sz-mirrorali.bilivideo.com" + UPOS_PATH + "&hdnts=x",
+        (akamai,),
+    )
+
+
 def test_bilibili_stream_urls_do_not_rewrite_non_upos_hosts(monkeypatch):
     """mcdn/PCDN 地址的路径和签名规则不同，不能换域名，只做备用地址排序"""
     monkeypatch.setattr(config, "BILI_PREFERRED_CDN_HOSTS", ["upos-sz-mirrorali.bilivideo.com"])
