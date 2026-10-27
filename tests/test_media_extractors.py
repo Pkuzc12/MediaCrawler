@@ -738,6 +738,74 @@ def test_bilibili_build_dash_item_supports_camel_case_base_url(monkeypatch):
     assert item.url == "https://upos/116.m4s"
 
 
+UPOS_PATH = "/upgcxcode/06/32/43006953206/43006953206-1-30080.m4s?deadline=1&upsig=s"
+
+
+def test_bilibili_stream_urls_prefer_configured_mirrors(monkeypatch):
+    """playurl 主地址换成偏好镜像排在最前，Akamai 等海外备用地址排在最后"""
+    monkeypatch.setattr(
+        config,
+        "BILI_PREFERRED_CDN_HOSTS",
+        ["upos-sz-mirrorali.bilivideo.com", "upos-sz-mirrorhw.bilivideo.com"],
+    )
+    stream = {
+        "base_url": "https://upos-sz-mirrorcosov.bilivideo.com" + UPOS_PATH,
+        "backup_url": [
+            "https://upos-hz-mirrorakam.akamaized.net" + UPOS_PATH + "&hdnts=x",
+            "https://upos-sz-mirrorcos.bilivideo.com" + UPOS_PATH,
+        ],
+    }
+
+    primary, backups = bili_media.order_stream_urls(stream)
+
+    assert primary == "https://upos-sz-mirrorali.bilivideo.com" + UPOS_PATH
+    assert backups == (
+        "https://upos-sz-mirrorhw.bilivideo.com" + UPOS_PATH,
+        "https://upos-sz-mirrorcosov.bilivideo.com" + UPOS_PATH,
+        "https://upos-sz-mirrorcos.bilivideo.com" + UPOS_PATH,
+        "https://upos-hz-mirrorakam.akamaized.net" + UPOS_PATH + "&hdnts=x",
+    )
+
+
+def test_bilibili_stream_urls_do_not_rewrite_non_upos_hosts(monkeypatch):
+    """mcdn/PCDN 地址的路径和签名规则不同，不能换域名，只做备用地址排序"""
+    monkeypatch.setattr(config, "BILI_PREFERRED_CDN_HOSTS", ["upos-sz-mirrorali.bilivideo.com"])
+    stream = {"base_url": "https://xy1x2x3xy.mcdn.bilivideo.cn:4483" + UPOS_PATH, "backup_url": []}
+
+    assert bili_media.order_stream_urls(stream) == (
+        "https://xy1x2x3xy.mcdn.bilivideo.cn:4483" + UPOS_PATH,
+        (),
+    )
+
+
+def test_bilibili_stream_urls_without_preference_keep_playurl_order(monkeypatch):
+    monkeypatch.setattr(config, "BILI_PREFERRED_CDN_HOSTS", [])
+    primary = "https://upos-sz-mirrorali.bilivideo.com" + UPOS_PATH
+    stream = {"base_url": primary, "backup_url": [primary, "https://upos-sz-mirrorhw.bilivideo.com" + UPOS_PATH]}
+
+    assert bili_media.order_stream_urls(stream) == (
+        primary,
+        ("https://upos-sz-mirrorhw.bilivideo.com" + UPOS_PATH,),
+    )
+
+
+def test_bilibili_dash_item_uses_preferred_mirrors_for_both_tracks(monkeypatch):
+    monkeypatch.setattr(config, "BILI_QN", 80)
+    monkeypatch.setattr(config, "BILI_PREFERRED_CDN_HOSTS", ["upos-sz-mirrorali.bilivideo.com"])
+    play_info = {
+        "dash": {
+            "video": [{"id": 80, "codecid": 7, "base_url": "https://upos-sz-mirrorcosov.bilivideo.com" + UPOS_PATH}],
+            "audio": [{"id": 30280, "base_url": "https://upos-sz-mirrorcosov.bilivideo.com" + UPOS_PATH}],
+        }
+    }
+
+    item = bili_media.build_dash_item(play_info, "BV1")
+
+    assert item.url.startswith("https://upos-sz-mirrorali.bilivideo.com/")
+    assert item.audio_url.startswith("https://upos-sz-mirrorali.bilivideo.com/")
+    assert item.backup_urls == ("https://upos-sz-mirrorcosov.bilivideo.com" + UPOS_PATH,)
+
+
 def test_bilibili_build_dash_item_requires_audio():
     play_info = {"dash": {"video": [{"id": 80, "base_url": "https://upos/v.m4s"}]}}
 

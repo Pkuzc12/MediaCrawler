@@ -28,7 +28,9 @@ B 站的播放地址需要先调 playurl 接口获取：
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+import re
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlsplit, urlunsplit
 
 import config
 from media_downloader import MediaItem, MediaType
@@ -42,6 +44,12 @@ MP4_FNVAL = 1
 # 同一清晰度下优先 AVC：下载后的文件要进剪辑软件/播放器，H.264 的兼容性最好
 _CODEC_PRIORITY = {7: 0, 13: 1, 12: 2}
 _UNKNOWN_CODEC_PRIORITY = 3
+
+# upos 源站镜像：同一条签名路径在任意 upos-*.bilivideo.com 上都可用，可以换域名；
+# mcdn/PCDN 等其他域名的路径和签名规则不同，不能换
+_UPOS_HOST = re.compile(r"^upos-[a-z0-9-]+\.bilivideo\.com$")
+# 有效候选地址上限：偏好镜像 + playurl 主地址 + 备用地址
+MAX_DASH_CANDIDATES = 8
 
 
 def _as_dict(value) -> Dict:
@@ -74,6 +82,33 @@ def _stream_backup_urls(stream) -> tuple:
         return ()
     backups = stream.get("backup_url") or stream.get("backupUrl") or []
     return tuple(url for url in backups if isinstance(url, str) and url)
+
+
+def _is_domestic(url: str) -> bool:
+    return urlsplit(url).netloc.endswith(".bilivideo.com")
+
+
+def order_stream_urls(stream) -> Tuple[str, Tuple[str, ...]]:
+    """按下载优先级排列一路流的候选地址，返回 (主地址, 备用地址)。
+
+    顺序：主地址换成 ``BILI_PREFERRED_CDN_HOSTS`` 里的各个镜像 -> playurl 给的主地址
+    -> 国内备用地址 -> 海外备用地址（Akamai 等）。playurl 的主地址常是腾讯 EdgeOne
+    或 cos 镜像，备用地址常是海外的 Akamai，国内用户实测都明显慢于阿里/华为镜像。
+    """
+    primary = _stream_url(stream)
+    backups = _stream_backup_urls(stream)
+    candidates: List[str] = []
+    parts = urlsplit(primary)
+    if _UPOS_HOST.match(parts.netloc) and parts.path.startswith("/upgcxcode/"):
+        for host in getattr(config, "BILI_PREFERRED_CDN_HOSTS", None) or []:
+            if isinstance(host, str) and host:
+                candidates.append(urlunsplit(parts._replace(netloc=host)))
+    candidates.append(primary)
+    candidates.extend(url for url in backups if _is_domestic(url))
+    candidates.extend(url for url in backups if not _is_domestic(url))
+
+    ordered = list(dict.fromkeys(url for url in candidates if url))
+    return ordered[0], tuple(ordered[1:])
 
 
 def build_cover_item(view: Dict, content_id: str) -> Optional[MediaItem]:
@@ -135,11 +170,13 @@ def build_dash_item(play_info: Dict, content_id: str, preferred_quality: Optiona
     if video_stream is None or audio_stream is None:
         return None
 
+    video_url, video_backups = order_stream_urls(video_stream)
+    audio_url, audio_backups = order_stream_urls(audio_stream)
     return MediaItem(
-        url=_stream_url(video_stream),
-        backup_urls=_stream_backup_urls(video_stream),
-        audio_url=_stream_url(audio_stream),
-        audio_backup_urls=_stream_backup_urls(audio_stream),
+        url=video_url,
+        backup_urls=video_backups,
+        audio_url=audio_url,
+        audio_backup_urls=audio_backups,
         media_type=MediaType.VIDEO,
         content_id=content_id,
         stem="video",

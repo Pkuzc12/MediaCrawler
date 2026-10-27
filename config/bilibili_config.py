@@ -54,6 +54,17 @@ BILI_SEARCH_MODE = "normal"
 # Note: Higher definition requires account/video support
 BILI_QN = 80
 
+# Video/audio CDN hosts tried first when downloading DASH media. The signed
+# /upgcxcode/ path from playurl works on any upos-*.bilivideo.com mirror, so these
+# hosts are tried before the ones playurl returns; foreign mirrors (Akamai) go last.
+# Measured 2026-10-27 on one home connection in China: ali 137, estgoss 124,
+# hw 120 MB/min vs. cosov 72 and Akamai 6-48. Set to [] to keep playurl's order.
+BILI_PREFERRED_CDN_HOSTS = [
+    "upos-sz-mirrorali.bilivideo.com",
+    "upos-sz-mirrorhw.bilivideo.com",
+    "upos-sz-estgoss.bilivideo.com",
+]
+
 # Whether to crawl user information
 CREATOR_MODE = True
 

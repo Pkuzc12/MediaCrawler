@@ -692,6 +692,8 @@ class BilibiliCrawler(AbstractCrawler):
                 platform="bili",
                 proxy=getattr(self.bili_client, "proxy", None),
                 extra_headers=self._media_headers(),
+                # 偏好镜像排在 playurl 地址前面，默认的 3 个候选会挤掉 playurl 自己的地址
+                max_candidates=bili_media.MAX_DASH_CANDIDATES,
             )
         else:
             self._media_downloader.update_credentials(
