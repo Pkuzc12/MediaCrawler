@@ -197,6 +197,19 @@ async def test_resume_from_partial_file(server, downloader, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_first_request_always_sends_range(server, downloader):
+    """回归：B 站腾讯 EdgeOne 镜像对不带 Range 的 GET 回 567，首次请求也必须带 bytes=0-"""
+    item = make_item(server, "/range-only/photo")
+
+    result = await downloader.download(item)
+
+    assert result is not None
+    assert result.read_bytes() == DEFAULT_CONTENT
+    assert server.request_count == 1
+    assert server.requests[0].headers.get("range") == "bytes=0-"
+
+
+@pytest.mark.asyncio
 async def test_server_ignoring_range_falls_back_to_full_download(server, downloader, tmp_path):
     item = make_item(server, "/no-range/photo")
     part = part_path_for(tmp_path, item, item.url)
@@ -233,10 +246,10 @@ async def test_stale_part_larger_than_remote_triggers_416_restart(server, downlo
 
     assert result is not None
     assert result.read_bytes() == DEFAULT_CONTENT
-    # 第一次带越界的 Range 拿到 416，片段被丢弃后第二次必须不带 Range 重新下载
+    # 第一次带越界的 Range 拿到 416，片段被丢弃后第二次必须从 0 重新下载
     assert server.request_count == 2
     assert server.requests[0].headers.get("range") == f"bytes={oversized}-"
-    assert server.requests[1].headers.get("range") is None
+    assert server.requests[1].headers.get("range") == "bytes=0-"
 
 
 @pytest.mark.asyncio
@@ -252,7 +265,7 @@ async def test_mismatched_content_range_start_discards_partial_file(server, down
     assert result.read_bytes() == DEFAULT_CONTENT
     assert server.request_count == 2
     assert server.requests[0].headers.get("range") == "bytes=1024-"
-    assert server.requests[1].headers.get("range") is None, "片段被丢弃后应重新完整下载"
+    assert server.requests[1].headers.get("range") == "bytes=0-", "片段被丢弃后应从 0 重新完整下载"
 
 
 @pytest.mark.asyncio
@@ -499,7 +512,7 @@ async def test_stale_part_from_other_url_is_discarded(server, downloader, tmp_pa
 
     assert result is not None
     assert result.read_bytes() == DEFAULT_CONTENT
-    assert server.requests[0].headers.get("range") is None, "不同 URL 的片段不应被当作续传基础"
+    assert server.requests[0].headers.get("range") == "bytes=0-", "不同 URL 的片段不应被当作续传基础"
     assert not stale_part.exists(), "成功后应清理同 stem 的陈旧片段"
     assert not list(result.parent.glob("*.part"))
 

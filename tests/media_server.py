@@ -102,6 +102,12 @@ class _MediaRequestHandler(BaseHTTPRequestHandler):
                 self._send_body(code, b"", "text/plain")
             elif path.startswith("/ok/") or path.startswith("/redirected/"):
                 self._handle_ok(path.rsplit("/", 1)[-1], query)
+            elif path.startswith("/range-only/"):
+                # B 站腾讯 EdgeOne 镜像：不带 Range 的整文件 GET 回 567，只服务分段请求
+                if self._parse_range() is None:
+                    self._send_body(567, b"<html>567</html>", "text/html")
+                else:
+                    self._handle_ok(path.rsplit("/", 1)[-1], query)
             elif path.startswith("/no-range/"):
                 self._handle_no_range(path.rsplit("/", 1)[-1])
             elif path.startswith("/wrong-range/"):

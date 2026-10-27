@@ -425,13 +425,13 @@ class MediaDownloader:
         """执行一次流式 GET，成功返回 Content-Type。
 
         续传语义：
-        - 本地存在 ``.part`` 片段 -> 带 ``Range`` 请求
+        - 总是带 ``Range``：无片段时为 ``bytes=0-``，有 ``.part`` 片段时从其末尾续传。
+          部分 CDN 只服务分段请求（B 站腾讯 EdgeOne 镜像对不带 Range 的整文件 GET 一律回 567）
         - 206 -> 追加写；200（服务端忽略 Range）-> 截断重写；416 -> 片段失效，重来
         """
         resume_from = part_path.stat().st_size if part_path.exists() else 0
         headers = self._build_headers(item)
-        if resume_from > 0:
-            headers["Range"] = f"bytes={resume_from}-"
+        headers["Range"] = f"bytes={resume_from}-"
 
         async with client.stream("GET", url, headers=headers) as response:
             status = response.status_code
